@@ -1,0 +1,234 @@
+---
+title: "MATH 342W - Final Project"
+author: "Hadassah Krigsman"
+date: "2024-05-14"
+output: html_document
+---
+
+### Load the Data
+```{r load data, echo=T, results='hide', message=FALSE, warning=FALSE}
+
+# Load necessary libraries
+pacman::p_load(skimr, dplyr, magrittr, lubridate, stringr, ggplot2, missForest)
+
+library(tidyverse)  # A collection of R packages for data manipulation and visualization
+library(readr)      # For reading CSV files
+
+# Load the dataset
+housing_data = read_csv('housing_data_2016_2017.csv')
+zip_data = read_csv('US-zip-codes.csv')
+skimr::skim(housing_data)
+
+```
+
+### Clean the data:
+
+```{r clean data, echo=T, results='hide', message=FALSE, warning=FALSE}
+
+# Remove unnecessary columns
+
+housing_data = housing_data[, !(colnames(housing_data) %in% c('HITId', 'HITTypeId', 'Title', 'Description', 'Keywords', 'Reward', 'CreationTime', 'MaxAssignments', 'RequesterAnnotation', 'AssignmentDurationInSeconds', 'AutoApprovalDelayInSeconds', 'Expiration', 'NumberOfSimilarHITs', 'LifetimeInSeconds', 'AssignmentId', 'WorkerId', 'AssignmentStatus', 'AcceptTime', 'SubmitTime', 'AutoApprovalTime', 'ApprovalTime', 'RejectionTime', 'RequesterFeedback', 'WorkTimeInSeconds', 'LifetimeApprovalRate', 'Last30DaysApprovalRate', 'Last7DaysApprovalRate', 'URL', 'url'))]
+
+
+# Function to reverse strings
+reverse_string = function(s) {
+  sapply(lapply(strsplit(s, NULL), rev), paste, collapse = "")
+}
+
+# Function to extract zip code by searching from the end
+extract_zip_code = function(address) {
+  # Reverse the address string
+  reversed_address = reverse_string(address)
+  
+  # Regular expression for reversed zip code
+  reversed_zip_code_pattern = "\\b\\d{5}(?:-\\d{4})?\\b"
+  
+  # Extract the reversed zip code using the pattern
+  reversed_zip_code = str_extract(reversed_address, reversed_zip_code_pattern)
+  
+  # Reverse the extracted zip code back to its original form
+  zip_code = ifelse(!is.na(reversed_zip_code), reverse_string(reversed_zip_code), NA)
+  
+  return(zip_code)
+}
+
+# Bin approx_year_built into 20-year periods
+approx_year_bins = seq(min(housing_data$approx_year_built, na.rm = TRUE), 
+            max(housing_data$approx_year_built, na.rm = TRUE), by = 20)
+
+housing_data = housing_data %>%
+  mutate(approx_year_built_binned = cut(approx_year_built, breaks = approx_year_bins, include.lowest = TRUE, right = FALSE)) %>%
+  mutate(approx_year_built_binned = as.factor(approx_year_built_binned))
+
+
+housing_data = housing_data %>%
+
+  # clean specific columns
+  mutate(
+    kitchen_type = factor(ifelse(kitchen_type %in% c("eat in", "Eat In", "Eat in", "eatin"), "eat-in",
+                          ifelse(kitchen_type %in% c("Combo", "combo"), "combo",
+                          ifelse(grepl("^[0-9]+$", kitchen_type), NA,
+                          ifelse(kitchen_type %in% c("efficiency", "efficiency kitchen", "efficiemcy", "efficiency ktchen"), "efficiency", kitchen_type))))),
+    cats_allowed = factor(ifelse(cats_allowed %in% c('yes', 'y'), 1, 0)),
+    dogs_allowed = factor(ifelse(dogs_allowed %in% c('yes', 'yes89'), 1, 0)),
+    coop_condo = factor(ifelse(coop_condo == 'co-op', 1, 0)),
+    garage_listed = factor(ifelse(!is.na(garage_exists), 1, 0)),
+    fuel_type = factor(ifelse(fuel_type %in% c("Other", "none"), "other", fuel_type)),
+    dining_room_type = factor(dining_room_type),
+    date_of_sale = as.Date(date_of_sale, format='%m/%d/%Y'),
+    month_of_sale = month(date_of_sale),
+    season_of_sale = factor(ifelse(month_of_sale %in% c(12, 1, 2), "Winter",
+                      ifelse(month_of_sale %in% c(3, 4, 5), "Spring",
+                      ifelse(month_of_sale %in% c(6, 7, 8), "Summer",
+                      ifelse(month_of_sale %in% c(9, 10, 11), "Fall", NA))))),
+    common_charges = as.numeric(gsub('[^0-9.-]', '', common_charges)),
+    maintenance_cost = as.numeric(gsub('[^0-9.-]', '', maintenance_cost)),
+    parking_charges = as.numeric(gsub('[^0-9.-]', '', parking_charges)),
+    total_taxes = as.numeric(gsub('[^0-9.-]', '', total_taxes)),
+    listing_price_to_nearest_1000 = as.numeric(gsub('[^0-9.-]', '', listing_price_to_nearest_1000)), 
+    sale_price = as.numeric(gsub('[^0-9.-]', '', sale_price)),
+    zip_code = sapply(full_address_or_zip_code, extract_zip_code))
+
+skimr::skim(housing_data)
+ 
+housing_data = housing_data %>% 
+  # remove unnecessary columns (either because there are too many NAs or because we just don't need them)
+  select(-num_half_bathrooms, -full_address_or_zip_code, -model_type, -date_of_sale, -month_of_sale, -listing_price_to_nearest_1000, -garage_exists, -approx_year_built)
+  
+housing_data = housing_data %>%
+  # calculate 'total_charges'
+  mutate(
+    common_charges = replace_na(common_charges, 0),
+    maintenance_cost = replace_na(maintenance_cost, 0),
+    total_taxes = replace_na(total_taxes, 0),
+    total_charges = common_charges + maintenance_cost + total_taxes) %>%
+  select(-common_charges, -maintenance_cost, -total_taxes) %>% 
+  filter(!is.na(total_charges))
+
+
+# merge with the US zip code data to obtain the latitude-longitude data
+housing_data = housing_data %>%
+  left_join(zip_data, by = c("zip_code" = "ZIP")) %>%
+  mutate(zip_code = factor(zip_code))
+
+# create a mapping of zip codes to areas in order to collapse 'zip_code'
+zipcode_to_area = c(
+  "11361" = "Northeast Queens", "11362" = "Northeast Queens", "11363" = "Northeast Queens", "11364" = "Northeast Queens",
+  "11354" = "North Queens", "11355" = "North Queens", "11356" = "North Queens", "11357" = "North Queens", "11358" = "North Queens", "11359" = "North Queens", "11360" = "North Queens",
+  "11365" = "Central Queens", "11366" = "Central Queens", "11367" = "Central Queens",
+  "11412" = "Jamaica", "11423" = "Jamaica", "11432" = "Jamaica", "11433" = "Jamaica", "11434" = "Jamaica", "11435" = "Jamaica", "11436" = "Jamaica",
+  "11101" = "Northwest Queens", "11102" = "Northwest Queens", "11103" = "Northwest Queens", "11104" = "Northwest Queens", "11105" = "Northwest Queens", "11106" = "Northwest Queens",
+  "11374" = "West Central Queens", "11375" = "West Central Queens", "11379" = "West Central Queens", "11385" = "West Central Queens",
+  "11004" = "Southeast Queens", "11005" = "Southeast Queens", "11411" = "Southeast Queens", "11413" = "Southeast Queens", "11422" = "Southeast Queens", "11426" = "Southeast Queens", "11427" = "Southeast Queens", "11428" = "Southeast Queens", "11429" = "Southeast Queens",
+  "11414" = "Southwest Queens", "11415" = "Southwest Queens", "11416" = "Southwest Queens", "11417" = "Southwest Queens", "11418" = "Southwest Queens", "11419" = "Southwest Queens", "11420" = "Southwest Queens", "11421" = "Southwest Queens",
+  "11368" = "West Queens", "11369" = "West Queens", "11370" = "West Queens", "11372" = "West Queens", "11373" = "West Queens", "11377" = "West Queens", "11378" = "West Queens"
+)
+housing_data = housing_data %>%
+  mutate(area = factor(zipcode_to_area[as.character(zip_code)], levels = unique(zipcode_to_area))) %>%
+  select(-zip_code)
+
+# filter out all of the rows where 'sale_price' is NA
+housing_data_filtered = housing_data %>%
+  filter(!is.na(sale_price))
+
+skimr::skim(housing_data_filtered)
+
+```
+### Missing Data
+
+```{r missing data, echo=T, results='hide', message=FALSE, warning=FALSE}
+
+# split the data
+X = housing_data_filtered %>% select(-sale_price)
+y = housing_data_filtered$sale_price
+
+# create a matrix that represents missingness
+M = apply(is.na(X), 2, as.numeric)
+colnames(M) = paste("is_missing_", colnames(X), sep = "")
+M = M[, colSums(M) > 0]
+M = as_tibble(t(unique(t(M))))
+skim(M)
+
+# combine imputed data with the missingness matrix
+X_imp = cbind(X, M)
+
+# impute the data
+pacman::p_load(missForest)
+X_imp = missForest(data.frame(X_imp))$ximp
+
+skimr::skim(X_imp)
+
+
+```
+
+### Modeling
+
+```{r data splits for modeling, echo=T, results='hide', message=FALSE, warning=FALSE}
+set.seed(8)
+n_train = sample(1:nrow(X_imp), 420)
+n_test = setdiff(1:nrow(X_imp), n_train)
+
+y_train = y[n_train]
+y_test = y[n_test]
+X_train = X_imp[n_train, ]
+X_test = X_imp[n_test, ]
+```
+
+# Regression Tree Modeling
+
+```{r regression tree, echo=T, results='hide'}
+pacman::p_load(YARF)
+
+tree_mod = YARFCART(X_train, y_train, calculate_oob_error = FALSE)
+get_tree_num_nodes_leaves_max_depths(tree_mod)
+
+illustrate_trees(tree_mod, max_depth = 4, margin_in_px= 100, length_in_px_per_half_split = 40, open_file = TRUE)
+
+#in-sample stats
+y_hat_train = predict(tree_mod, X_train)
+e_rt = y_train - y_hat_train # regression tree error
+sd(e_rt)#in-sample rmse
+1 - sd(e_rt) / sd(y_train) #in-sample r-squared
+
+#oos stats
+y_hat_test = predict(tree_mod, X_test)
+e_rt_oos = y_test - y_hat_test
+sd(e_rt_oos)#oos rmse
+1 - sd(e_rt_oos) / sd(y_test)#oos r-squared
+
+```
+
+# Linear Modeling
+
+```{r linear model, echo=T, results='hide'}
+set.seed(8)
+n_train = sample(1:nrow(X_imp), 420)
+n_test = setdiff(1:nrow(X_imp), n_train)
+y_train = y[n_train]
+y_test = y[n_test]
+X_train = X_imp[n_train, ]
+X_test = X_imp[n_test, ]
+
+linear_mod = lm(y_train ~ ., X_train)
+summary(linear_mod)
+summary(linear_mod)$sigma #rmse
+summary(linear_mod)$r.squared #r-squared
+
+yhat_oos = predict(linear_mod, X_test)
+oos_e = y_test - yhat_oos
+sd(oos_e) # oos RMSE
+
+SST = sum((y_test - mean(y_test))^2)
+1 - sum(oos_e^2) / SST # oos r-squared
+
+```
+# Random Forest Modeling
+
+```{r}
+model_rf = YARF(data.frame(X_train), y_train)
+y_hat_test = predict(model_rf, data.frame(X_test))
+
+sqrt(mean((y_hat_test - y_test)^2)) #oob rmse
+1 - sum((y_test - y_hat_test)^2)/sum((y_test - mean(y))^2) #oob r-squared
+
+```
